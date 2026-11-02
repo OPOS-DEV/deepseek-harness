@@ -1,0 +1,165 @@
+name: Package Desktop · macOS Intel · unsigned release
+
+run-name: Intel DMG ${{ inputs.source_ref }} / ${{ inputs.release_tag || 'auto-tag' }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: '打包的源码 ref：分支或 dsh-v* tag'
+        type: string
+        default: master
+        required: true
+      build_version:
+        description: '可选：覆盖打包版本号；留空跟随 package.json'
+        type: string
+        default: ''
+        required: false
+      release_tag:
+        description: '可选：Release 标签；留空自动生成 dsh-v<version>-intel.<run_number>'
+        type: string
+        default: ''
+        required: false
+      prerelease:
+        description: '发布为 Pre-release'
+        type: boolean
+        default: true
+        required: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: macos-intel-unsigned-release
+  cancel-in-progress: false
+
+jobs:
+  package:
+    runs-on: macos-15-intel
+    timeout-minutes: 300
+    defaults:
+      run:
+        shell: bash
+    env:
+      DSH_TELEMETRY_DISABLED: '1'
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ inputs.source_ref }}
+          persist-credentials: false
+          clean: true
+
+      - uses: pnpm/action-setup@v5.0.0
+
+      - uses: actions/setup-node@v7.0.0
+        with:
+          node-version: '24'
+          cache: pnpm
+
+      # A hosted macOS runner starts with 14 GB of disk; the monorepo build needs more.
+      - name: Free runner disk space
+        run: |
+          selected=$(xcode-select -p | sed -E 's#(/Applications/[^/]+\.app).*#\1#')
+          for app in /Applications/Xcode*.app; do
+            [ -e "$app" ] || continue
+            [ "$app" = "$selected" ] && continue
+            sudo rm -rf "$app"
+          done
+          sudo rm -rf /Library/Developer/CoreSimulator/Profiles/Runtimes/* || true
+          sudo rm -rf /usr/local/lib/android /usr/local/share/dotnet "$HOME/.dotnet" || true
+          sudo rm -rf "$HOME/Library/Caches/Homebrew" || true
+          df -h /
+
+      - name: Install locked dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build unsigned DMG
+        env:
+          BUILD_VERSION: ${{ inputs.build_version }}
+        run: |
+          args=()
+          if [ -n "$BUILD_VERSION" ]; then args+=(--build-version "$BUILD_VERSION"); fi
+          pnpm run package:desktop:mac:x64:unsigned "${args[@]}"
+
+      - name: Collect release assets
+        id: assets
+        run: |
+          dmg=$(find apps/desktop/.desktop-build/targets/mac-x64/unsigned-artifacts -maxdepth 1 \
+            -name '*-mac-x64-unsigned.dmg' ! -name '._*' | head -1)
+          [ -n "$dmg" ] || { echo "no DMG produced" >&2; exit 1; }
+          shasum -a 256 "$dmg" > SHA256SUMS.txt
+          version=$(basename "$dmg" | sed -E 's/^deepseek-harness-(.*)-mac-x64-unsigned\.dmg$/\1/')
+          {
+            echo "dmg=$dmg"
+            echo "name=$(basename "$dmg")"
+            echo "version=$version"
+            echo "sha256=$(cut -d' ' -f1 SHA256SUMS.txt)"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Publish release
+        if: ${{ inputs.prerelease || inputs.release_tag != '' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          SOURCE_REF: ${{ inputs.source_ref }}
+          SOURCE_SHA: ${{ github.sha }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          PRERELEASE: ${{ inputs.prerelease }}
+          VERSION: ${{ steps.assets.outputs.version }}
+          DMG: ${{ steps.assets.outputs.dmg }}
+          DMG_NAME: ${{ steps.assets.outputs.name }}
+          DMG_SHA256: ${{ steps.assets.outputs.sha256 }}
+          RUN_NUMBER: ${{ github.run_number }}
+        run: |
+          tag=${RELEASE_TAG:-dsh-v${VERSION}-intel.${RUN_NUMBER}}
+          {
+            echo "Unofficial **Intel (x86_64)** build of the DeepSeek Harness desktop app, built from \`${SOURCE_REF}\` at \`${SOURCE_SHA}\`."
+            echo
+            echo "> This build is **unsigned and unnotarized**, intended for local testing on Intel Macs."
+            echo
+            echo "## Install"
+            echo
+            echo "1. Download and open \`${DMG_NAME}\`"
+            echo "2. Drag the app to \`/Applications\`"
+            echo "3. First launch is blocked by Gatekeeper. Either right-click the app and choose **Open**, or run:"
+            echo
+            echo '   ```sh'
+            echo '   xattr -dr com.apple.quarantine "/Applications/DeepSeek Harness.app"'
+            echo '   ```'
+            echo
+            echo "## Checksums"
+            echo
+            echo '```'
+            echo "${DMG_SHA256}  ${DMG_NAME}"
+            echo '```'
+            echo
+            echo "## Scope"
+            echo
+            echo "- macOS Intel (x86_64) only; Apple Silicon users should use the official arm64 build"
+            echo "- No auto-update, no notarization, no code signing beyond ad-hoc"
+          } > RELEASE_NOTES.md
+          prerelease=()
+          if [ "$PRERELEASE" = true ]; then prerelease+=(--prerelease); fi
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" "$DMG" SHA256SUMS.txt --clobber
+            if [ "$PRERELEASE" = true ]; then gh release edit "$tag" --prerelease; fi
+          else
+            gh release create "$tag" "$DMG" SHA256SUMS.txt \
+              --target "$SOURCE_SHA" \
+              --title "${VERSION} - macOS Intel (x86_64) unsigned" \
+              --notes-file RELEASE_NOTES.md \
+              "${prerelease[@]}"
+          fi
+          gh release view "$tag" --json url,assets --jq '{url, assets: [.assets[].name]}'
+
+      - name: Retain installers
+        if: always() && steps.assets.outcome == 'success'
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: macos-x64-unsigned-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ steps.assets.outputs.dmg }}
+            SHA256SUMS.txt
+          compression-level: 0
+          if-no-files-found: error
+          retention-days: 14
